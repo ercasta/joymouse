@@ -33,6 +33,12 @@ const int PIN_BTN_LEFT   = 4;   // left click button
 const int PIN_BTN_RIGHT  = 5;   // right click button
 const int PIN_BTN_SCROLL = 6;   // "enable scroll" button
 
+// Set to true if a given axis is physically mounted mirrored (e.g. the
+// joystick is rotated), so that axis needs to be flipped around the
+// calibrated center. Independent flags so you can flip just one, both, or neither.
+const bool FLIP_X = true;
+const bool FLIP_Y = true;
+
 // ---- ADC oversampling ----
 const int ADC_OVERSAMPLE_COUNT = 5; // number of samples averaged per reading
 
@@ -206,6 +212,13 @@ void loop() {
   int rawX = readAveraged(PIN_VRX, ADC_OVERSAMPLE_COUNT);
   int rawY = readAveraged(PIN_VRY, ADC_OVERSAMPLE_COUNT);
 
+  if (FLIP_X) {
+    rawX = 2 * centerX - rawX;
+  }
+  if (FLIP_Y) {
+    rawY = 2 * centerY - rawY;
+  }
+  
   updateRange(rawX, rawY);
 
   bool scrollMode = (digitalRead(PIN_BTN_SCROLL) == LOW);
