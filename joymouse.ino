@@ -1,5 +1,5 @@
 /*
- * Joystick BLE/USB Mouse - Version 7: flick + cruise (AVERAGE), with ADC oversampling (ESP32-S3)
+ * Joystick USB Mouse - Version 7.2: flick + cruise (AVERAGE, 4-point speed curve) + slow auto-recentering (ESP32-S3)
  * ---------------------------------------------------------------------------
  * Behavior:
  * - Inside the deadzone: idle, zero speed, timer/average reset.
@@ -8,24 +8,31 @@
  *   is tracked.
  *   - After HOLD_TIMEOUT_MS the average is frozen: from then on, if you're
  *     still outside the deadzone (a sustained push, not a flick), the
- *     CRUISE speed stays constant, proportional to the AVERAGE gesture
- *     speed of the initial phase (not the current instantaneous gesture).
- *     A stronger flick gives a faster cruise, but always "small" relative
- *     to the original average (CRUISE_SCALE < 1).
+ *     CRUISE speed stays constant. Its value comes from a 4-point curve
+ *     that maps the average flick velocity to a speed in px/s.
  * - Returning to the deadzone resets everything (speed, timer, average).
+ * - When the stick stays still near the center for a while, the calibrated
+ *   center slowly follows it (absorbs ADC/thermal drift).
  *
  * ADC readings are oversampled (averaged over a few samples) to reduce
  * jitter, since speed is derived directly from the raw ADC delta.
  *
  * Requires: Arduino-ESP32 core 3.x, ESP32-S3 board with native USB OTG/HID
  * Tools > USB Mode: "USB-OTG (TinyUSB)"
- * Tools > USB CDC On Boot: Enabled (handy for Serial Monitor/debugging)
  */
 
 #include "USB.h"
 #include "USBHIDMouse.h"
 
 USBHIDMouse Mouse;
+
+// ---- Types ----
+// Must stay ABOVE the first function: the Arduino IDE auto-generates function
+// prototypes there, and they need this type to be already declared.
+struct RecenterState {
+  int ref = -1;                       // value the stick has been sitting around
+  unsigned long stillSinceMs = 0;
+};
 
 // ---- Pin configuration (match your actual wiring) ----
 const int PIN_VRX        = 1;   // joystick X axis (ADC)
@@ -52,22 +59,30 @@ int readAveraged(int pin, int samples) {
   return sum / samples;
 }
 
-// ---- Tuning: "gesture" phase (first HOLD_TIMEOUT_MS outside the deadzone) ----
-const float VELOCITY_TO_SPEED_MOVE   = 2.2;   // scales velocityPerMs -> px/cycle (raised)
-const float VELOCITY_TO_SPEED_SCROLL = 0.8;
-const int   MAX_SPEED_CAP_MOVE   = 80;        // raised max cursor speed
+// ---- Tuning: speed curve (average flick velocity -> cruise speed) ----
+// 4 points: CURVE_VEL[i] (average velocity of the initial flick, ADC counts/ms)
+// gives CURVE_SPEED_*[i] (px/s for the cursor, wheel ticks/s for scroll).
+//  - Between points the curve is interpolated as a power law (a straight line
+//    on a log-log plot), so it is smooth.
+//  - Below the first point it keeps falling (same slope as the first segment).
+//  - Above the last point the speed stays at the last value.
+//  - Points must be strictly increasing, both in velocity and in speed.
+// The velocities below are PLACEHOLDERS: use DEBUG_CURVE to read the average
+// velocity of your own slow / medium / fast / very fast flicks and put them here.
+const float CURVE_VEL[4]          = {1.0, 3.0, 7.0, 20.0};        // counts/ms
+const float CURVE_SPEED_MOVE[4]   = {30.0, 80.0, 200.0, 3000.0};  // px/s
+const float CURVE_SPEED_SCROLL[4] = {9.0, 26.0, 62.0, 176.0};     // wheel ticks/s (about the old linear feel)
+
+// Safety cap on what is sent in one cycle (px or wheel ticks per cycle)
+const int   MAX_SPEED_CAP_MOVE   = 80;
 const int   MAX_SPEED_CAP_SCROLL = 6;
-const float VELOCITY_NOISE_FLOOR = 0.15;      // below this, treat as ADC noise, not real movement
 
-// ---- Tuning: "cruise" phase (after HOLD_TIMEOUT_MS, still outside the deadzone) ----
-// NOTE: the average velocity is lower than the peak, so these scales were
-// raised compared to v6 (was 0.15) to get a similar cruise speed. Tune by feel.
-const unsigned long HOLD_TIMEOUT_MS = 100;    // time before the average is frozen (cruise)
-const float CRUISE_SCALE_MOVE   = 0.40;       // cruise = average_velocity * this scale
-const float CRUISE_SCALE_SCROLL = 0.40;
-const int   CRUISE_MIN_SPEED_MOVE   = 1;      // guaranteed minimum cruise speed
-const int   CRUISE_MIN_SPEED_SCROLL = 1;
+// Prints the average velocity and the resulting speed on Serial, every cycle
+// while outside the deadzone. Flick and read the "avg" value.
+const bool DEBUG_CURVE = false;
 
+// Time before the average is frozen (start of the constant cruise)
+const unsigned long HOLD_TIMEOUT_MS = 100;
 
 const int   LOOP_DELAY_MS        = 12;   // ~80Hz, main loop (movement)
 const int   LOOP_DELAY_MS_SCROLL = 36;   // slower update rate while scrolling
@@ -76,13 +91,50 @@ const float PRECISION_MODE_INCREMENT = (15.0 * LOOP_DELAY_MS) / 1000.0;   // 15 
 
 
 // ---- Center calibration (read at boot, joystick at rest) ----
-int centerX = 2048;
-int centerY = 2048;
+int   centerX = 2048;
+int   centerY = 2048;
+float centerXf = 2048;   // float versions, so the center can move by fractions of a count
+float centerYf = 2048;
+
+// ---- Slow auto-recentering ----
+// If the stick stays within RECENTER_STILL_BAND counts of the same value for
+// RECENTER_SETTLE_MS, and is close to the current center, the center slowly
+// moves toward it. "Close" = within RECENTER_MAX_OFFSET_FACTOR * deadzone, so
+// a deliberate push (e.g. holding for cruise) is not absorbed.
+const unsigned long RECENTER_SETTLE_MS = 500;
+const int   RECENTER_STILL_BAND        = 20;    // counts: "still" means staying within this band
+const float RECENTER_MAX_OFFSET_FACTOR = 1.5;   // x deadzone
+const float RECENTER_RATE              = 0.01;  // fraction of the offset absorbed per cycle
+
+RecenterState recX, recY;
+
+// rawUnflipped: the ADC reading BEFORE the FLIP_X/FLIP_Y mirroring.
+void updateRecenter(RecenterState &st, int rawUnflipped, float &centerF, int &centerInt, int deadzone) {
+  unsigned long nowMs = millis();
+
+  if (st.ref < 0 || abs(rawUnflipped - st.ref) > RECENTER_STILL_BAND) {
+    st.ref = rawUnflipped;
+    st.stillSinceMs = nowMs;
+    return;
+  }
+  if (nowMs - st.stillSinceMs < RECENTER_SETTLE_MS) return;
+
+  float offset = rawUnflipped - centerF;
+  if (fabs(offset) > deadzone * RECENTER_MAX_OFFSET_FACTOR) return;
+
+  centerF += offset * RECENTER_RATE;
+  centerInt = (int)(centerF + 0.5f);
+}
 
 // ---- Adaptive range calibration (min/max observed during use) ----
 int minX = 4095, maxX = 0, minY = 4095, maxY = 0;
 int dynamicDeadzoneX = 100;
 int dynamicDeadzoneY = 100;
+
+// Floor for the deadzone, in ADC counts. Must be above the ADC noise at rest,
+// otherwise the stick is seen as "outside the deadzone" even when untouched
+// (the adaptive deadzone starts at ~0 until the stick is pushed to full range).
+const int MIN_DEADZONE = 60;
 
 void updateRange(int rawX, int rawY) {
   if (rawX < minX) minX = rawX;
@@ -90,8 +142,10 @@ void updateRange(int rawX, int rawY) {
   if (rawY < minY) minY = rawY;
   if (rawY > maxY) maxY = rawY;
 
-  dynamicDeadzoneX = (int)((maxX - centerX) * 0.025);
-  dynamicDeadzoneY = (int)((maxY - centerY) * 0.025);
+  int rangeX = max(maxX - centerX, centerX - minX);
+  int rangeY = max(maxY - centerY, centerY - minY);
+  dynamicDeadzoneX = max(MIN_DEADZONE, (int)(rangeX * 0.025));
+  dynamicDeadzoneY = max(MIN_DEADZONE, (int)(rangeY * 0.025));
 }
 
 void calibrateCenter() {
@@ -102,8 +156,10 @@ void calibrateCenter() {
     sumY += analogRead(PIN_VRY);
     delay(5);
   }
-  centerX = sumX / samples;
-  centerY = sumY / samples;
+  centerXf = (float)sumX / samples;
+  centerYf = (float)sumY / samples;
+  centerX = (int)(centerXf + 0.5f);
+  centerY = (int)(centerYf + 0.5f);
 }
 
 // ---- State for cursor movement (X, Y) and scroll (Y) ----
@@ -131,13 +187,27 @@ float cruiseAccumX = 0, cruiseAccumY = 0, cruiseAccumScroll = 0;
 
 bool lastScrollMode = false; // to detect the transition and reset scroll state
 
+// Speed (units per second) for a given |average velocity| (counts/ms),
+// read from the 4-point curve CURVE_VEL -> speeds.
+float curveSpeed(float v, const float *speeds) {
+  if (v <= 0) return 0;
+  if (v >= CURVE_VEL[3]) return speeds[3];
+
+  // find the segment [i, i+1] that contains v (below the first point: segment 0, extrapolated)
+  int i = 0;
+  while (i < 2 && v > CURVE_VEL[i + 1]) i++;
+
+  float slope = logf(speeds[i + 1] / speeds[i]) / logf(CURVE_VEL[i + 1] / CURVE_VEL[i]);
+  return speeds[i] * powf(v / CURVE_VEL[i], slope);
+}
+
 // Computes the output speed for this cycle (px or scroll ticks).
 int computeSpeed(int raw, int &lastRaw, unsigned long &lastMicrosRef,
                   unsigned long &exitDeadzoneTime, float &velocitySum, int &sampleCount,
                   float &cruiseAccum,
                   int center, int deadzone,
-                  float velocityToSpeed, int maxSpeedCap,
-                  float cruiseScale, int cruiseMinSpeed, bool precisionMode, float precisionModeSpeed) {
+                  const float *speedCurve, int maxSpeedCap,
+                  bool precisionMode, float precisionModeSpeed) {
   unsigned long now = micros();
 
   if (lastRaw == -1) {
@@ -187,16 +257,23 @@ int computeSpeed(int raw, int &lastRaw, unsigned long &lastMicrosRef,
   if (precisionMode) {
     // move at fixed speed, direction given by where the stick is relative to center
     int sign = delta > 0 ? 1 : -1;
-    Serial.printf("raw=%d center=%d sign=%d\n", raw, center, sign);
-
     cruiseAccum += precisionModeSpeed * sign;
   }
 
   else {
-    // ---- move at average velocity: constant speed, proportional to the initial flick's AVERAGE ----
+    // ---- cruise: constant speed, from the initial flick's AVERAGE through the 4-point curve ----
     float avgVelocity = (sampleCount > 0) ? (velocitySum / sampleCount) : 0;
-    float cruiseSpeed = abs(avgVelocity) * velocityToSpeed * cruiseScale;
+
+    // The curve gives units per SECOND; convert to units per CYCLE with the real
+    // cycle time. The clamp guards against a stale timestamp (e.g. right after
+    // switching between scroll and move mode).
+    float speedPerSec = curveSpeed(fabsf(avgVelocity), speedCurve);
+    float cycleMs = (dtMs > 60.0) ? 60.0 : dtMs;
+    float cruiseSpeed = speedPerSec * cycleMs / 1000.0;
     if (cruiseSpeed > maxSpeedCap) cruiseSpeed = maxSpeedCap;
+
+    if (DEBUG_CURVE) Serial.printf("avg=%.2f counts/ms -> %.0f /s\n", avgVelocity, speedPerSec);
+
     float speedPerCycle = (avgVelocity >= 0 ? 1 : -1) * cruiseSpeed;
     cruiseAccum += speedPerCycle;
   }
@@ -231,6 +308,10 @@ void loop() {
   int rawX = readAveraged(PIN_VRX, ADC_OVERSAMPLE_COUNT);
   int rawY = readAveraged(PIN_VRY, ADC_OVERSAMPLE_COUNT);
 
+  // Slow auto-recentering works on the UN-flipped readings
+  updateRecenter(recX, rawX, centerXf, centerX, dynamicDeadzoneX);
+  updateRecenter(recY, rawY, centerYf, centerY, dynamicDeadzoneY);
+
   if (FLIP_X) {
     rawX = 2 * centerX - rawX;
   }
@@ -260,8 +341,8 @@ void loop() {
                                 exitDeadzoneTimeY_scroll, velocitySumY_scroll, sampleCountY_scroll,
                                 cruiseAccumScroll,
                                 centerY, dynamicDeadzoneY,
-                                VELOCITY_TO_SPEED_SCROLL, MAX_SPEED_CAP_SCROLL,
-                                CRUISE_SCALE_SCROLL, CRUISE_MIN_SPEED_SCROLL, precisionMode, PRECISION_MODE_INCREMENT);
+                                CURVE_SPEED_SCROLL, MAX_SPEED_CAP_SCROLL,
+                                precisionMode, PRECISION_MODE_INCREMENT);
     if (scrollY != 0) {
       Mouse.move(0, 0, scrollY);
     }
@@ -270,14 +351,14 @@ void loop() {
                               exitDeadzoneTimeX_move, velocitySumX_move, sampleCountX_move,
                               cruiseAccumX,
                               centerX, dynamicDeadzoneX,
-                              VELOCITY_TO_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
-                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE, precisionMode, PRECISION_MODE_INCREMENT);
+                              CURVE_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
+                              precisionMode, PRECISION_MODE_INCREMENT);
     int moveY = computeSpeed(rawY, lastRawY_move, lastMicrosY_move,
                               exitDeadzoneTimeY_move, velocitySumY_move, sampleCountY_move,
                               cruiseAccumY,
                               centerY, dynamicDeadzoneY,
-                              VELOCITY_TO_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
-                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE, precisionMode, PRECISION_MODE_INCREMENT);
+                              CURVE_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
+                              precisionMode, PRECISION_MODE_INCREMENT);
     if (moveX != 0 || moveY != 0) {
       Mouse.move(moveX, moveY);
     }
