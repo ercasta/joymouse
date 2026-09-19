@@ -69,7 +69,7 @@ int readAveraged(int pin, int samples) {
 //  - Points must be strictly increasing, both in velocity and in speed.
 // The velocities below are PLACEHOLDERS: use DEBUG_CURVE to read the average
 // velocity of your own slow / medium / fast / very fast flicks and put them here.
-const float CURVE_VEL[4]          = {1.0, 3.0, 7.0, 20.0};        // counts/ms
+const float CURVE_VEL[4]          = {1.0, 7.0, 12.0, 20.0};        // counts/ms
 const float CURVE_SPEED_MOVE[4]   = {30.0, 80.0, 200.0, 3000.0};  // px/s
 const float CURVE_SPEED_SCROLL[4] = {9.0, 26.0, 62.0, 176.0};     // wheel ticks/s (about the old linear feel)
 
