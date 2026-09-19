@@ -83,8 +83,8 @@ int readAveraged(int pin, int samples) {
 //  - Thresholds must be strictly increasing, both in tilt and in speed.
 //  - To add or remove a threshold, change CURVE_N and the arrays together.
 const int   CURVE_N = 4;
-const float CURVE_TILT[CURVE_N]         = {0.15, 0.40, 0.70, 0.93};    // fraction of the travel
-const float CURVE_SPEED_MOVE[CURVE_N]   = {40.0, 120.0, 300.0, 600.0}; // px/s
+const float CURVE_TILT[CURVE_N]         = {0.15, 0.40, 0.70, 0.90};    // fraction of the travel
+const float CURVE_SPEED_MOVE[CURVE_N]   = {40.0, 120.0, 300.0, 800.0}; // px/s
 const float CURVE_SPEED_SCROLL[CURVE_N] = {4.0, 12.0, 30.0, 60.0};     // wheel ticks/s
 
 // ---- Tuning: boost (top speed) ----
@@ -96,7 +96,7 @@ const float CURVE_SPEED_SCROLL[CURVE_N] = {4.0, 12.0, 30.0, 60.0};     // wheel 
 // (tilt >= BOOST_TILT - BOOST_TILT_HYST) and stops as soon as it comes back below.
 const float BOOST_TILT       = 0.90;    // fraction of the travel
 const float BOOST_TILT_HYST  = 0.08;
-const float BOOST_REACH_MS   = 30.0;   // max time from leaving the deadzone to the end of the travel
+const float BOOST_REACH_MS   = 50.0;   // max time from leaving the deadzone to the end of the travel
 const float BOOST_RAMP_MS    = 0.0;     // time to go from the curve value to the top speed (0 = instantly)
 const float BOOST_SPEED_MOVE   = 3000.0;   // px/s
 const float BOOST_SPEED_SCROLL = 176.0;    // wheel ticks/s
