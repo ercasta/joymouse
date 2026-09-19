@@ -1,17 +1,18 @@
 /*
- * Joystick BLE/USB Mouse - Version 6: flick + cruise, with ADC oversampling (ESP32-S3)
+ * Joystick BLE/USB Mouse - Version 7: flick + cruise (AVERAGE), with ADC oversampling (ESP32-S3)
  * ---------------------------------------------------------------------------
  * Behavior:
- * - Inside the deadzone: idle, zero speed, timer/peak reset.
- * - Just outside the deadzone: a timer starts, and the PEAK gesture speed
- *   (ADC counts per ms) seen so far in this "outing" is tracked.
-  *   - After HOLD_TIMEOUT_MS, if you're still outside the deadzone (a
- *     sustained push, not a flick): switch to a constant CRUISE speed,
- *     proportional to the PEAK gesture speed from the initial phase (not
- *     the current instantaneous gesture) - a stronger flick gives a
- *     faster cruise, but always "small" relative to the original peak
- *     (CRUISE_SCALE < 1).
- * - Returning to the deadzone resets everything (speed, timer, peak).
+ * - Inside the deadzone: idle, zero speed, timer/average reset.
+ * - Just outside the deadzone: a timer starts, and the AVERAGE gesture speed
+ *   (ADC counts per ms, mean of the samples) seen so far in this "outing"
+ *   is tracked.
+ *   - After HOLD_TIMEOUT_MS the average is frozen: from then on, if you're
+ *     still outside the deadzone (a sustained push, not a flick), the
+ *     CRUISE speed stays constant, proportional to the AVERAGE gesture
+ *     speed of the initial phase (not the current instantaneous gesture).
+ *     A stronger flick gives a faster cruise, but always "small" relative
+ *     to the original average (CRUISE_SCALE < 1).
+ * - Returning to the deadzone resets everything (speed, timer, average).
  *
  * ADC readings are oversampled (averaged over a few samples) to reduce
  * jitter, since speed is derived directly from the raw ADC delta.
@@ -32,6 +33,7 @@ const int PIN_VRY        = 2;   // joystick Y axis (ADC)
 const int PIN_BTN_LEFT   = 4;   // left click button
 const int PIN_BTN_RIGHT  = 5;   // right click button
 const int PIN_BTN_SCROLL = 6;   // "enable scroll" button
+const int PIN_BTN_PRECISION = 7;   // "precision mode" button
 
 // Set to true if a given axis is physically mounted mirrored (e.g. the
 // joystick is rotated), so that axis needs to be flipped around the
@@ -58,14 +60,20 @@ const int   MAX_SPEED_CAP_SCROLL = 6;
 const float VELOCITY_NOISE_FLOOR = 0.15;      // below this, treat as ADC noise, not real movement
 
 // ---- Tuning: "cruise" phase (after HOLD_TIMEOUT_MS, still outside the deadzone) ----
-const unsigned long HOLD_TIMEOUT_MS = 100;    // time before switching to cruise
-const float CRUISE_SCALE_MOVE   = 0.15;       // cruise = peak_velocity * this scale (small)
-const float CRUISE_SCALE_SCROLL = 0.15;
+// NOTE: the average velocity is lower than the peak, so these scales were
+// raised compared to v6 (was 0.15) to get a similar cruise speed. Tune by feel.
+const unsigned long HOLD_TIMEOUT_MS = 100;    // time before the average is frozen (cruise)
+const float CRUISE_SCALE_MOVE   = 0.40;       // cruise = average_velocity * this scale
+const float CRUISE_SCALE_SCROLL = 0.40;
 const int   CRUISE_MIN_SPEED_MOVE   = 1;      // guaranteed minimum cruise speed
 const int   CRUISE_MIN_SPEED_SCROLL = 1;
 
+
 const int   LOOP_DELAY_MS        = 12;   // ~80Hz, main loop (movement)
 const int   LOOP_DELAY_MS_SCROLL = 36;   // slower update rate while scrolling
+
+const float PRECISION_MODE_INCREMENT = (15.0 * LOOP_DELAY_MS) / 1000.0;   // 15 pixel / sec
+
 
 // ---- Center calibration (read at boot, joystick at rest) ----
 int centerX = 2048;
@@ -110,13 +118,13 @@ unsigned long lastMicrosY_scroll = 0;
 unsigned long exitDeadzoneTimeX_move = 0, exitDeadzoneTimeY_move = 0;
 unsigned long exitDeadzoneTimeY_scroll = 0;
 
-// Peak |velocityPerMs| reached during the "gesture" phase of this outing
-float peakVelocityX_move = 0, peakVelocityY_move = 0;
-float peakVelocityY_scroll = 0;
-
-// Sign of the peak (direction), fixed when the peak is updated
-int peakSignX_move = 1, peakSignY_move = 1;
-int peakSignY_scroll = 1;
+// Sum of the signed velocityPerMs samples collected during the "gesture"
+// phase of this outing, and how many samples were collected.
+// average = velocitySum / sampleCount (the sign of the average is the direction).
+float velocitySumX_move = 0, velocitySumY_move = 0;
+float velocitySumY_scroll = 0;
+int   sampleCountX_move = 0, sampleCountY_move = 0;
+int   sampleCountY_scroll = 0;
 
 // Fractional remainder for cruise speed accumulation (avoids truncation loss)
 float cruiseAccumX = 0, cruiseAccumY = 0, cruiseAccumScroll = 0;
@@ -125,11 +133,11 @@ bool lastScrollMode = false; // to detect the transition and reset scroll state
 
 // Computes the output speed for this cycle (px or scroll ticks).
 int computeSpeed(int raw, int &lastRaw, unsigned long &lastMicrosRef,
-                  unsigned long &exitDeadzoneTime, float &peakVelocity, int &peakSign,
+                  unsigned long &exitDeadzoneTime, float &velocitySum, int &sampleCount,
                   float &cruiseAccum,
                   int center, int deadzone,
                   float velocityToSpeed, int maxSpeedCap,
-                  float cruiseScale, int cruiseMinSpeed) {
+                  float cruiseScale, int cruiseMinSpeed, bool precisionMode, float precisionModeSpeed) {
   unsigned long now = micros();
 
   if (lastRaw == -1) {
@@ -151,7 +159,8 @@ int computeSpeed(int raw, int &lastRaw, unsigned long &lastMicrosRef,
 
   if (abs(delta) < deadzone) {
     // Inside the deadzone: full reset
-    peakVelocity = 0;
+    velocitySum = 0;
+    sampleCount = 0;
     exitDeadzoneTime = 0;
     cruiseAccum = 0;
     return 0;
@@ -160,29 +169,38 @@ int computeSpeed(int raw, int &lastRaw, unsigned long &lastMicrosRef,
   // Outside the deadzone: if this is the first cycle of this outing, mark the timestamp
   if (exitDeadzoneTime == 0) {
     exitDeadzoneTime = now;
-    peakVelocity = 0;
+    velocitySum = 0;
+    sampleCount = 0;
   }
 
   unsigned long timeOutsideMs = (now - exitDeadzoneTime) / 1000;
 
   if (timeOutsideMs < HOLD_TIMEOUT_MS) {
-  
-    // ---- Gesture phase: output speed follows the gesture instant by instant ----
-    // Track the absolute peak reached in this initial window.
-    if (abs(velocityPerMs) > abs(peakVelocity)) {
-      peakVelocity = velocityPerMs;
-      peakSign = (velocityPerMs > 0) ? 1 : -1;
-    }
-  } 
+    // ---- Gesture phase: accumulate samples for the average ----
+    // After HOLD_TIMEOUT_MS the sum and count stay frozen, so the average
+    // (and therefore the cruise speed) stays constant.
+    velocitySum += velocityPerMs;
+    sampleCount++;
+  }
 
-  // ---- move at peak velocity: constant speed, proportional to the initial flick's PEAK ----
-  float cruiseSpeed = abs(peakVelocity) * velocityToSpeed * cruiseScale;
 
-  if (cruiseSpeed > maxSpeedCap) cruiseSpeed = maxSpeedCap;
+  if (precisionMode) {
+    // move at fixed speed, direction given by where the stick is relative to center
+    int sign = delta > 0 ? 1 : -1;
+    Serial.printf("raw=%d center=%d sign=%d\n", raw, center, sign);
 
-  float speedPerCycle = peakSign * cruiseSpeed;
+    cruiseAccum += precisionModeSpeed * sign;
+  }
 
-  cruiseAccum += speedPerCycle;
+  else {
+    // ---- move at average velocity: constant speed, proportional to the initial flick's AVERAGE ----
+    float avgVelocity = (sampleCount > 0) ? (velocitySum / sampleCount) : 0;
+    float cruiseSpeed = abs(avgVelocity) * velocityToSpeed * cruiseScale;
+    if (cruiseSpeed > maxSpeedCap) cruiseSpeed = maxSpeedCap;
+    float speedPerCycle = (avgVelocity >= 0 ? 1 : -1) * cruiseSpeed;
+    cruiseAccum += speedPerCycle;
+  }
+
   int output = (int)cruiseAccum;
   cruiseAccum -= output;
   return output;
@@ -195,6 +213,7 @@ void setup() {
   pinMode(PIN_BTN_LEFT, INPUT_PULLUP);
   pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
   pinMode(PIN_BTN_SCROLL, INPUT_PULLUP);
+  pinMode(PIN_BTN_PRECISION, INPUT_PULLUP);
 
   analogReadResolution(12); // 0-4095
 
@@ -218,45 +237,47 @@ void loop() {
   if (FLIP_Y) {
     rawY = 2 * centerY - rawY;
   }
-  
+
   updateRange(rawX, rawY);
 
   bool scrollMode = (digitalRead(PIN_BTN_SCROLL) == LOW);
   bool leftPressed = (digitalRead(PIN_BTN_LEFT) == LOW);
   bool rightPressed = (digitalRead(PIN_BTN_RIGHT) == LOW);
+  bool precisionMode = (digitalRead(PIN_BTN_PRECISION) == LOW);
 
   // Clean reset of scroll state when entering/exiting scroll mode
   if (scrollMode != lastScrollMode) {
     lastRawY_scroll = -1;
     exitDeadzoneTimeY_scroll = 0;
-    peakVelocityY_scroll = 0;
+    velocitySumY_scroll = 0;
+    sampleCountY_scroll = 0;
     cruiseAccumScroll = 0;
   }
   lastScrollMode = scrollMode;
 
   if (scrollMode) {
     int scrollY = computeSpeed(rawY, lastRawY_scroll, lastMicrosY_scroll,
-                                exitDeadzoneTimeY_scroll, peakVelocityY_scroll, peakSignY_scroll,
+                                exitDeadzoneTimeY_scroll, velocitySumY_scroll, sampleCountY_scroll,
                                 cruiseAccumScroll,
                                 centerY, dynamicDeadzoneY,
                                 VELOCITY_TO_SPEED_SCROLL, MAX_SPEED_CAP_SCROLL,
-                                CRUISE_SCALE_SCROLL, CRUISE_MIN_SPEED_SCROLL);
+                                CRUISE_SCALE_SCROLL, CRUISE_MIN_SPEED_SCROLL, precisionMode, PRECISION_MODE_INCREMENT);
     if (scrollY != 0) {
       Mouse.move(0, 0, scrollY);
     }
   } else {
     int moveX = computeSpeed(rawX, lastRawX_move, lastMicrosX_move,
-                              exitDeadzoneTimeX_move, peakVelocityX_move, peakSignX_move,
+                              exitDeadzoneTimeX_move, velocitySumX_move, sampleCountX_move,
                               cruiseAccumX,
                               centerX, dynamicDeadzoneX,
                               VELOCITY_TO_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
-                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE);
+                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE, precisionMode, PRECISION_MODE_INCREMENT);
     int moveY = computeSpeed(rawY, lastRawY_move, lastMicrosY_move,
-                              exitDeadzoneTimeY_move, peakVelocityY_move, peakSignY_move,
+                              exitDeadzoneTimeY_move, velocitySumY_move, sampleCountY_move,
                               cruiseAccumY,
                               centerY, dynamicDeadzoneY,
                               VELOCITY_TO_SPEED_MOVE, MAX_SPEED_CAP_MOVE,
-                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE);
+                              CRUISE_SCALE_MOVE, CRUISE_MIN_SPEED_MOVE, precisionMode, PRECISION_MODE_INCREMENT);
     if (moveX != 0 || moveY != 0) {
       Mouse.move(moveX, moveY);
     }
